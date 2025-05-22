@@ -25,7 +25,7 @@ python3 -m pip install -r requirements.txt
 Run the evaluation using:
 
 ```bash
-python3 main.py <ALGOD_ACCOUNT_ADDRESS>
+python3 main.py <ALGORAND_ACCOUNT_ADDRESS>
 ```
 
 ### Output
