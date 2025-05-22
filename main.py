@@ -5,6 +5,7 @@ Note: one-time key registration is considered and it is assumed the evaluated ac
 
 Disclaimer: the code serves to illustrate an example and provides no guarantees of correctness.
 """
+import json
 import argparse
 import requests
 from typing import Tuple
@@ -24,6 +25,10 @@ from utils import (
 def get_online_stake() -> int:
     """Get the current online stake from Nodely.
 
+    Notes
+    -----
+    https://afmetrics.api.nodely.io/v1/api-docs/#get-/v1/realtime/participation/online
+
     Returns
     -------
     int
@@ -31,8 +36,108 @@ def get_online_stake() -> int:
     """
     url = "https://afmetrics.api.nodely.io/v1/realtime/participation/online"
     response = requests.get(url)
-    response.json()
     return int(response.json()['stake_micro_algo'])
+
+
+def get_online_stake_history(
+    round_start: int,
+    round_end: int
+) -> dict:
+    """Get the online stake history within a certain time window from Nodely.
+
+    Notes
+    -----
+    Online stake is averaged across 10 rounds.
+    https://afmetrics.api.nodely.io/v1/api-docs/#get-/v1/delayed/totalstake/history
+
+    Parameters
+    ----------
+    round_start: int
+        First round in observation window.
+    round_end: int
+        End round in observation window.
+
+    Returns
+    -------
+    dict
+        Online stake per 10 rounds in the observation window.
+    """
+    url = "https://afmetrics.api.nodely.io/v1/delayed/totalstake/history"
+    params = {
+        "from": f"{round_start}",
+        "to": f"{round_end}"
+    }
+    headers = {"accept": "*/*"}
+    response = requests.get(url, params=params, headers=headers)
+    data = [json.loads(line) for line in response.text.strip().split('\n')]
+    total_stake = np.array([d['total_stake'] for d in data])
+    total_stake = total_stake.round()
+    total_stake = [int(ts) for ts in total_stake]
+    round_list = [f'{r}' for r in range(round_end, round_start, -10)]
+    stake_per_round = dict(zip(round_list, total_stake))
+    return stake_per_round
+
+
+def get_account_balance_history(
+    indexer_client: IndexerClient,
+    address: str,
+    round_start: int,
+    round_end: int,
+    limit: int=1000
+) -> dict:
+    """Get account balance within a certain time window from Nodely.
+
+    Notes
+    -----
+    https://mainnet-idx.4160.nodely.dev/x2/api-docs/#tag/accounts
+
+    Parameters
+    ----------
+    indexer_client: IndexerClient
+        Indexer client.
+    address: str
+        Algorand account address.
+    round_start: int
+        first round in observation window.
+    round_end: int
+        Last round in observation window.
+    limit: int, optional
+        Max. number of fetched transaction. Default is 1000.
+
+    Returns
+    -------
+    dict
+        Online stake for each round that the balance changed within the observation window.
+    """
+    # account_balance = np.array([], dtype=int)
+    # for round_num in range(round_end, round_start, -10):
+    #     url = f"https://mainnet-idx.4160.nodely.dev/x2/account/{address}/snapshot/{round_num}/0"
+    #     headers = {"accept": "*/*"}
+    #     response = requests.get(url, headers=headers)
+    #     balance_on_round = int(response.json()['balance']*10**-6)
+    #     account_balance = np.r_[account_balance, balance_on_round]
+    # Get final balance
+    url = f"https://mainnet-idx.4160.nodely.dev/x2/account/{address}/snapshot/{round_end}/0"
+    headers = {"accept": "*/*"}
+    response = requests.get(url, headers=headers)
+    balance_previous = response.json()['balance']
+    # Loop over transactions and derive balance on round of transaction
+    response = indexer_client.search_transactions_by_address(address, limit=limit)
+    transactions = response['transactions']
+    account_balance = dict()
+    for idx, txn in enumerate(transactions):
+        account_balance[f'{round_end}'] = int(round(balance_previous*10**-6))
+        if txn['confirmed-round'] >= round_end:
+            continue
+        if txn['confirmed-round'] < round_start:
+            break
+        if txn['tx-type']=='pay':
+            txn_amount = txn['payment-transaction']['amount']
+            if txn['payment-transaction']['receiver'] == address:
+                balance_previous += txn_amount
+            else:
+                balance_previous -= txn_amount
+    return account_balance
 
 
 def calculate_likelihood_of_no_rewards_simple(
@@ -65,6 +170,42 @@ def calculate_likelihood_of_no_rewards_simple(
     return (1 - percentage_of_total_stake)**rounds_since_last_reward
 
 
+def calculate_likelihood_of_no_rewards(
+    account_stake: dict, 
+    total_stake: dict
+) -> float:
+    """Calculate the likelihood based on the account and total stake history.
+
+    Parameters
+    ----------
+    account_stake : dict
+        Amount of stake that the account owned during the time window.
+    total_stake : dict
+        Amount of stake during the desired time window.
+
+    Returns
+    -------
+    float
+        Likelihood of no rewards happening.
+    """
+    account_stake_keys = np.array(list(account_stake.keys())).astype(int)[::-1]
+    account_stake_values = np.array(list(account_stake.values())).astype(int)[::-1]
+    total_stake_keys = np.array(list(total_stake.keys())).astype(int)
+    total_stake_values = np.array(list(total_stake.values())).astype(int)
+    trunc_total_stake_keys = np.copy(total_stake_keys)
+    portion_of_total_stake = np.array([])
+    weights = np.array([])
+    for ask, asv in zip(account_stake_keys, account_stake_values): # Iterate from lower round number to higher round number
+        mask = trunc_total_stake_keys <= ask
+        mean_total_stake = np.mean(total_stake_values[mask])
+        portion_of_total_stake = np.r_[portion_of_total_stake, asv / mean_total_stake]
+        trunc_total_stake_keys = trunc_total_stake_keys[np.logical_not(mask)] # Prep for next iteration
+        weights = np.r_[weights, np.sum(mask) / total_stake_keys.size]
+    mean_portion_of_total_stake = np.mean(portion_of_total_stake*weights)
+    number_of_rounds = int(np.diff(total_stake_keys[[-1, 0]])[0])
+    return (1 - mean_portion_of_total_stake)**number_of_rounds
+
+
 def get_no_rewards_stats(
     algod_client: AlgodClient,
     indexer_client: IndexerClient,
@@ -86,10 +227,6 @@ def get_no_rewards_stats(
     Tuple[float, float]
         The amount of seconds since the last produced block and the likelihood of going with no rewards for this long.
     """
-    total_online_stake = get_online_stake()
-    account_stake = indexer_client.account_info(
-        address=address
-    )['account']['amount']
     current_round = algod_client.status()['last-round']
     round_of_latest_block_reward = get_round_of_latest_block_reward(
         indexer_client=indexer_client,
@@ -98,10 +235,19 @@ def get_no_rewards_stats(
         last_round=current_round
     )
     rounds_since_last_reward = current_round - round_of_latest_block_reward
-    likelihood_of_no_rewards = calculate_likelihood_of_no_rewards_simple(
+    total_online_stake = get_online_stake_history(
+        round_start=round_of_latest_block_reward,
+        round_end=current_round
+    )
+    account_stake = get_account_balance_history(
+        indexer_client=indexer_client,
+        address=address,
+        round_start=round_of_latest_block_reward,
+        round_end=current_round
+    )
+    likelihood_of_no_rewards = calculate_likelihood_of_no_rewards(
         account_stake,
-        total_online_stake, 
-        rounds_since_last_reward
+        total_online_stake
     )
     return (
         convert_round_delta_to_time_delta(rounds_since_last_reward), 
